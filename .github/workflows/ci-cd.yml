@@ -1,14 +1,10 @@
-name: TaskFlow CI/CD Pipeline
+name: TaskFlow Single Server CI/CD
 
 on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop]
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+    branches: [main]
 
 jobs:
   test:
@@ -22,16 +18,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
       - name: Test backend
         run: |
           cd backend
           pip install -r requirements.txt
           python manage.py test
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
       - name: Test frontend
         run: |
@@ -40,72 +36,60 @@ jobs:
           npm run test
           npm run build
 
-  build:
+  deploy-staging:
     runs-on: self-hosted
     needs: test
-    if: github.event_name == 'push'
-    outputs:
-      backend-image: ${{ steps.build-backend.outputs.image }}
-      frontend-image: ${{ steps.build-frontend.outputs.image }}
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build backend image
-        id: build-backend
-        run: |
-          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${{ github.sha }} ./backend
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${{ github.sha }}
-          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${{ github.sha }}" >> $GITHUB_OUTPUT
-
-      - name: Build frontend image
-        id: build-frontend
-        run: |
-          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend:${{ github.sha }} ./frontend
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend:${{ github.sha }}
-          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend:${{ github.sha }}" >> $GITHUB_OUTPUT
-
-  deploy-staging:
-    runs-on: self-hosted
-    needs: build
-    if: github.ref == 'refs/heads/develop'
-    environment: staging
-    steps:
       - name: Deploy to staging
         run: |
           cd /opt/taskflow/staging
-          export BACKEND_IMAGE="${{ needs.build.outputs.backend-image }}"
-          export FRONTEND_IMAGE="${{ needs.build.outputs.frontend-image }}"
+          git pull origin develop
           docker-compose down
-          docker-compose pull
+          docker-compose build
           docker-compose up -d
-          
-      - name: Health check
-        run: |
           sleep 30
-          curl -f http://staging.taskflow.local/health || exit 1
+          curl -f http://localhost/health
 
   deploy-production:
     runs-on: self-hosted
-    needs: build
+    needs: test
     if: github.ref == 'refs/heads/main'
     environment: production
     steps:
-      - name: Blue-green deployment
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
         run: |
           cd /opt/taskflow/production
-          export BACKEND_IMAGE="${{ needs.build.outputs.backend-image }}"
-          export FRONTEND_IMAGE="${{ needs.build.outputs.frontend-image }}"
-          ./scripts/blue-green-deploy.sh
+          git pull origin main
           
-      - name: Production health check
+          # Blue-green deployment simulation
+          docker-compose -f docker-compose.yml -f docker-compose.backup.yml up -d --no-deps backend frontend
+          sleep 30
+          
+          # Health check
+          if curl -f https://taskflow.local/health; then
+            echo "Deployment successful"
+            docker-compose down --remove-orphans
+            docker-compose up -d
+          else
+            echo "Health check failed, rolling back"
+            docker-compose -f docker-compose.backup.yml up -d
+            exit 1
+          fi
+
+  backup:
+    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main'
+    schedule:
+      - cron: '0 2 * * *'  # Daily at 2 AM
+    steps:
+      - name: Backup databases
         run: |
-          sleep 60
-          curl -f https://taskflow.local/health || exit 1
+          /opt/taskflow/scripts/backup-all.sh
